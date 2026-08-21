@@ -1,12 +1,14 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context):
     keyboard = [
         [InlineKeyboardButton("🛒 فروشگاه", callback_data="shop")],
         [InlineKeyboardButton("📦 محصولات", callback_data="products")],
@@ -17,53 +19,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام 👋\n"
         "به فروشگاه ما خوش آمدید.\n\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "لطفاً یک گزینه را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
 
     if query.data == "shop":
-        await query.edit_message_text(
-            "🛒 فروشگاه\n\n"
-            "فعلاً محصولات فروشگاه در حال آماده‌سازی است."
-        )
+        text = "🛒 فروشگاه\n\nمحصولات فروشگاه به‌زودی اضافه می‌شوند."
 
     elif query.data == "products":
-        await query.edit_message_text(
-            "📦 محصولات\n\n"
-            "به‌زودی لیست محصولات و اشتراک‌ها اینجا نمایش داده می‌شود."
-        )
+        text = "📦 محصولات\n\nلیست اشتراک‌ها و اکانت‌ها به‌زودی اینجا نمایش داده می‌شود."
 
     elif query.data == "account":
         user = query.from_user
-        await query.edit_message_text(
+        text = (
             f"👤 حساب شما\n\n"
             f"نام: {user.first_name}\n"
-            f"شناسه کاربری: {user.id}"
+            f"شناسه: {user.id}"
         )
 
     elif query.data == "support":
-        await query.edit_message_text(
-            "📞 پشتیبانی\n\n"
-            "برای ارتباط با پشتیبانی، پیام خود را ارسال کنید."
-        )
+        text = "📞 پشتیبانی\n\nپیام خود را برای پشتیبانی ارسال کنید."
+
+    else:
+        text = "گزینه نامعتبر است."
+
+    await query.edit_message_text(text)
 
 
 def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN is not set")
 
+    if not RENDER_URL:
+        raise ValueError("RENDER_EXTERNAL_URL is not set")
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("Bot is running...")
-    app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="telegram",
+        webhook_url=f"{RENDER_URL}/telegram",
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
