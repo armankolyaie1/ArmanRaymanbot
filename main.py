@@ -595,12 +595,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
 
-    # Support mode: only active after the user presses Support.
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        support_handler,
-    ))
-
     admin_value_conversation = ConversationHandler(
         entry_points=[CallbackQueryHandler(
             button_handler, pattern=r"^admin_(price|stock):"
@@ -626,6 +620,13 @@ def main():
         fallbacks=[],
     )
     app.add_handler(vpn_conversation)
+
+    # Support handler must come after admin conversations so admin text
+    # is consumed by the active ConversationHandler state.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        support_handler,
+    ))
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
