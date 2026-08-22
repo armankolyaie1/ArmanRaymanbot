@@ -34,38 +34,93 @@ async def start(update: Update, context):
         "سلام 👋\n"
         "به فروشگاه ما خوش آمدید.\n\n"
         "لطفاً یک گزینه را انتخاب کنید:",
+     
         reply_markup=InlineKeyboardMarkup(keyboard),
-    )
 
-
-async def button_handler(update: Update, context):
+        async def button_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
 
     if query.data == "shop":
-        text = "🛒 فروشگاه\n\nمحصولات فروشگاه به‌زودی اضافه می‌شوند."
+        keyboard = [
+            [InlineKeyboardButton("📱 تلگرام پریمیوم", callback_data="telegram")],
+            [InlineKeyboardButton("🔐 اکانت‌ها", callback_data="accounts")],
+            [InlineKeyboardButton("🌐 کانفیگ VPN", callback_data="vpn")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
+        ]
+
+        await query.edit_message_text(
+            "🛒 فروشگاه\n\n"
+            "لطفاً دسته‌بندی موردنظر را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     elif query.data == "products":
-        text = "📦 محصولات\n\nلیست اشتراک‌ها و اکانت‌ها به‌زودی اینجا نمایش داده می‌شود."
+        keyboard = [
+            [InlineKeyboardButton("📱 تلگرام پریمیوم", callback_data="telegram")],
+            [InlineKeyboardButton("🔐 اکانت‌ها", callback_data="accounts")],
+            [InlineKeyboardButton("🌐 کانفیگ VPN", callback_data="vpn")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
+        ]
+
+        await query.edit_message_text(
+            "📦 محصولات\n\n"
+            "دسته‌بندی محصولات را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif query.data == "telegram":
+        await query.edit_message_text(
+            "📱 تلگرام پریمیوم\n\n"
+            "محصولات تلگرام پریمیوم به‌زودی اضافه می‌شوند."
+        )
+
+    elif query.data == "accounts":
+        await query.edit_message_text(
+            "🔐 اکانت‌ها\n\n"
+            "لیست اکانت‌های موجود به‌زودی اضافه می‌شود."
+        )
+
+    elif query.data == "vpn":
+        await query.edit_message_text(
+            "🌐 کانفیگ VPN\n\n"
+            "کانفیگ‌های موجود به‌زودی اضافه می‌شوند."
+        )
 
     elif query.data == "account":
         user = query.from_user
+
         text = (
-            f"👤 حساب شما\n\n"
+            "👤 حساب شما\n\n"
             f"نام: {user.first_name}\n"
             f"شناسه: {user.id}"
         )
 
+        await query.edit_message_text(text)
+
     elif query.data == "support":
-        text = "📞 پشتیبانی\n\nپیام خود را برای پشتیبانی ارسال کنید."
+        await query.edit_message_text(
+            "📞 پشتیبانی\n\n"
+            "برای ارتباط با پشتیبانی پیام خود را ارسال کنید."
+        )
+
+    elif query.data == "back":
+        keyboard = [
+            [InlineKeyboardButton("🛒 فروشگاه", callback_data="shop")],
+            [InlineKeyboardButton("📦 محصولات", callback_data="products")],
+            [InlineKeyboardButton("👤 حساب من", callback_data="account")],
+            [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")],
+        ]
+
+        await query.edit_message_text(
+            "👋 سلام\n\n"
+            "به فروشگاه ما خوش آمدید.\n\n"
+            "لطفاً یک گزینه را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     else:
-        text = "گزینه نامعتبر است."
-
-    await query.edit_message_text(text)
-
-
-def main():
+        await query.edit_message_text("❌ گزینه نامعتبر است.")
     if not TOKEN:
         raise ValueError("BOT_TOKEN is not set")
 
