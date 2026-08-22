@@ -1,5 +1,5 @@
 import os
-import psycopg
+import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,98 +12,23 @@ from telegram.ext import (
     filters,
 )
 
+import database as db
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
+WAIT_ADMIN_VALUE = 1
+WAIT_VPN_CONFIG = 2
+WAIT_SUPPORT = 3
 
-# =========================================================
-# DATABASE
-# =========================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-def get_db():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL is not set")
-
-    return psycopg.connect(DATABASE_URL)
-
-
-def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS products (
-                    id SERIAL PRIMARY KEY,
-                    category TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    duration INTEGER NOT NULL,
-                    price BIGINT NOT NULL DEFAULT 0,
-                    stock INTEGER NOT NULL DEFAULT 0,
-                    active BOOLEAN NOT NULL DEFAULT TRUE,
-                    UNIQUE(category, duration)
-                )
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    product_id INTEGER NOT NULL,
-                    price BIGINT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Telegram Premium
-            for duration in [1, 3, 6, 12]:
-                cur.execute("""
-                    INSERT INTO products
-                    (category, name, duration, price, stock)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (category, duration) DO NOTHING
-                """, (
-                    "telegram",
-                    "تلگرام پریمیوم",
-                    duration,
-                    0,
-                    0
-                ))
-
-            # VPN
-            for duration in [1, 3, 6, 12]:
-                cur.execute("""
-                    INSERT INTO products
-                    (category, name, duration, price, stock)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (category, duration) DO NOTHING
-                """, (
-                    "vpn",
-                    "کانفیگ VPN",
-                    duration,
-                    0,
-                    0
-                ))
-
-        conn.commit()
-
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def is_admin(user_id):
     return ADMIN_ID and str(user_id) == str(ADMIN_ID)
@@ -115,150 +40,90 @@ def format_price(price):
     return f"{price:,} تومان"
 
 
-def save_user(user):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (id, username, first_name)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (id)
-                DO UPDATE SET
-                    username = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name
-            """, (
-                user.id,
-                user.username,
-                user.first_name
-            ))
-        conn.commit()
+def status_name(status):
+    return {
+        "pending_payment": "⏳ در انتظار پرداخت",
+        "approved": "✅ تأیید شده",
+        "rejected": "❌ رد شده",
+        "delivered": "📦 تحویل شده",
+    }.get(status, status)
 
 
 def main_menu():
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🛒 فروشگاه", callback_data="shop")],
         [InlineKeyboardButton("📦 سفارش‌های من", callback_data="orders")],
         [InlineKeyboardButton("👤 حساب من", callback_data="account")],
         [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")],
-    ])
+    ]
+    if ADMIN_ID:
+        rows.append([InlineKeyboardButton("🔐 پنل مدیریت", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def shop_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "📱 تلگرام پریمیوم",
-            callback_data="category:telegram"
-        )],
-        [InlineKeyboardButton(
-            "🌐 VPN",
-            callback_data="category:vpn"
-        )],
+        [InlineKeyboardButton("📱 تلگرام پریمیوم", callback_data="category:telegram")],
+        [InlineKeyboardButton("🌐 VPN / VLESS", callback_data="category:vpn")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
     ])
 
 
-# =========================================================
-# START
-# =========================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    save_user(user)
-
+    db.save_user(user)
     await update.message.reply_text(
-        "سلام 👋\n\n"
-        "به فروشگاه ما خوش آمدید.\n\n"
-        "محصول موردنظر خود را انتخاب کنید:",
-        reply_markup=main_menu()
+        "سلام 👋\n\nبه فروشگاه ما خوش آمدید.\n\nمحصول موردنظر را انتخاب کنید:",
+        reply_markup=main_menu(),
     )
 
 
-# =========================================================
-# SHOP
-# =========================================================
-
 async def show_category(query, category):
-
-    title = "📱 تلگرام پریمیوم" if category == "telegram" else "🌐 VPN"
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, duration, price, stock
-                FROM products
-                WHERE category = %s
-                AND active = TRUE
-                ORDER BY duration
-            """, (category,))
-
-            products = cur.fetchall()
+    title = "📱 تلگرام پریمیوم" if category == "telegram" else "🌐 VPN / VLESS"
+    products = db.get_products(category)
 
     keyboard = []
+    for product_id, _, _, duration, price, stock, active in products:
+        if not active:
+            continue
 
-    for product_id, duration, price, stock in products:
-
-        if stock > 0 and price > 0:
-            text = (
-                f"{duration} ماهه | "
-                f"{format_price(price)}"
-            )
-        elif price == 0:
-            text = f"{duration} ماهه | قیمت تعیین نشده"
+        if price <= 0:
+            label = f"{duration} ماهه | قیمت تعیین نشده"
+        elif stock <= 0:
+            label = f"{duration} ماهه | ناموجود"
         else:
-            text = f"{duration} ماهه | ناموجود"
+            label = f"{duration} ماهه | {format_price(price)}"
 
         keyboard.append([
-            InlineKeyboardButton(
-                text,
-                callback_data=f"product:{product_id}"
-            )
+            InlineKeyboardButton(label, callback_data=f"product:{product_id}")
         ])
 
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 بازگشت",
-            callback_data="shop"
-        )
-    ])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="shop")])
 
     await query.edit_message_text(
-        f"{title}\n\n"
-        "پلن موردنظر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"{title}\n\nپلن موردنظر را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 async def show_product(query, product_id):
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, category, name, duration, price, stock
-                FROM products
-                WHERE id = %s
-            """, (product_id,))
-
-            product = cur.fetchone()
-
+    product = db.get_product(product_id)
     if not product:
         await query.answer("محصول پیدا نشد.", show_alert=True)
         return
 
-    product_id, category, name, duration, price, stock = product
+    pid, category, name, duration, price, stock, active = product
 
-    if price == 0:
+    if not active:
+        text = f"{name}\n\n❌ این محصول غیرفعال است."
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
+    elif price <= 0:
         text = (
             f"{name}\n"
             f"پلن: {duration} ماهه\n\n"
             "❌ قیمت این پلن هنوز تعیین نشده است."
         )
-
-        keyboard = [[
-            InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data=f"category:{category}"
-            )
-        ]]
-
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
     elif stock <= 0:
         text = (
             f"{name}\n"
@@ -266,756 +131,514 @@ async def show_product(query, product_id):
             f"💰 قیمت: {format_price(price)}\n"
             "❌ این پلن فعلاً ناموجود است."
         )
-
-        keyboard = [[
-            InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data=f"category:{category}"
-            )
-        ]]
-
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
     else:
         text = (
             f"{name}\n"
-            f"پلن: {duration} ماهه\n\n"
+            f"پلن: {duration} ماه\n"
             f"💰 قیمت: {format_price(price)}\n"
             f"📦 موجودی: {stock}\n\n"
-            "برای ثبت سفارش روی دکمه زیر بزنید."
+            "برای ادامه روی ثبت سفارش بزنید."
         )
-
         keyboard = [
-            [InlineKeyboardButton(
-                "🛒 ثبت سفارش",
-                callback_data=f"buy:{product_id}"
-            )],
-            [InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data=f"category:{category}"
-            )]
+            [InlineKeyboardButton("🛒 ثبت سفارش", callback_data=f"buy:{pid}")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")],
         ]
 
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-
-# =========================================================
-# CREATE ORDER
-# =========================================================
 
 async def create_order(query, product_id):
-
     user = query.from_user
+    try:
+        order_id, name, duration, price = db.create_order(user.id, product_id)
+    except ValueError as exc:
+        messages = {
+            "PRODUCT_NOT_FOUND": "محصول پیدا نشد.",
+            "PRODUCT_INACTIVE": "این محصول غیرفعال است.",
+            "PRICE_NOT_SET": "قیمت این محصول هنوز تعیین نشده است.",
+            "OUT_OF_STOCK": "این محصول فعلاً ناموجود است.",
+        }
+        await query.answer(messages.get(str(exc), "ثبت سفارش انجام نشد."), show_alert=True)
+        return
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT id, name, duration, price, stock
-                FROM products
-                WHERE id = %s
-                FOR UPDATE
-            """, (product_id,))
-
-            product = cur.fetchone()
-
-            if not product:
-                await query.answer(
-                    "محصول پیدا نشد.",
-                    show_alert=True
-                )
-                return
-
-            pid, name, duration, price, stock = product
-
-            if price <= 0:
-                await query.answer(
-                    "قیمت این محصول هنوز تعیین نشده است.",
-                    show_alert=True
-                )
-                return
-
-            if stock <= 0:
-                await query.answer(
-                    "این محصول ناموجود است.",
-                    show_alert=True
-                )
-                return
-
-            cur.execute("""
-                INSERT INTO orders
-                (user_id, product_id, price, status)
-                VALUES (%s, %s, %s, 'pending')
-                RETURNING id
-            """, (
-                user.id,
-                product_id,
-                price
-            ))
-
-            order_id = cur.fetchone()[0]
-
-            # رزرو یک موجودی
-            cur.execute("""
-                UPDATE products
-                SET stock = stock - 1
-                WHERE id = %s
-            """, (product_id,))
-
-        conn.commit()
-
+    # Payment gateway is intentionally isolated here.
+    # The order is NOT marked paid until gateway verification succeeds.
     await query.edit_message_text(
-        f"✅ سفارش شما ثبت شد.\n\n"
-        f"🧾 شماره سفارش: #{order_id}\n"
+        f"✅ سفارش #{order_id} ایجاد شد.\n\n"
         f"📦 محصول: {name}\n"
         f"📅 مدت: {duration} ماه\n"
         f"💰 مبلغ: {format_price(price)}\n\n"
-        "وضعیت سفارش: ⏳ در انتظار پرداخت",
+        "⏳ وضعیت: در انتظار پرداخت\n\n"
+        "درگاه پرداخت در مرحله بعد به این سفارش متصل می‌شود.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "🔙 فروشگاه",
-                callback_data="shop"
-            )]
-        ])
+            [InlineKeyboardButton("🔙 فروشگاه", callback_data="shop")],
+            [InlineKeyboardButton("📦 سفارش‌های من", callback_data="orders")],
+        ]),
     )
 
 
-# =========================================================
-# USER ORDERS
-# =========================================================
-
 async def show_orders(query):
-
-    user_id = query.from_user.id
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    orders.id,
-                    products.name,
-                    products.duration,
-                    orders.price,
-                    orders.status
-                FROM orders
-                JOIN products
-                ON products.id = orders.product_id
-                WHERE orders.user_id = %s
-                ORDER BY orders.id DESC
-                LIMIT 20
-            """, (user_id,))
-
-            orders = cur.fetchall()
-
+    orders = db.get_user_orders(query.from_user.id)
     if not orders:
         text = "📦 شما هنوز سفارشی ثبت نکرده‌اید."
-
     else:
         lines = ["📦 سفارش‌های شما:\n"]
-
-        status_names = {
-            "pending": "⏳ در انتظار پرداخت",
-            "approved": "✅ تأیید شده",
-            "rejected": "❌ رد شده",
-        }
-
-        for order_id, name, duration, price, status in orders:
+        for oid, name, duration, price, status, created_at in orders:
             lines.append(
-                f"🧾 #{order_id}\n"
+                f"🧾 #{oid}\n"
                 f"{name} - {duration} ماه\n"
                 f"💰 {format_price(price)}\n"
-                f"وضعیت: {status_names.get(status, status)}\n"
+                f"وضعیت: {status_name(status)}\n"
             )
-
         text = "\n".join(lines)
 
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data="back"
-            )]
-        ])
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
+        ]),
     )
 
-
-# =========================================================
-# ACCOUNT
-# =========================================================
 
 async def show_account(query):
-
-    user = query.from_user
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM orders
-                WHERE user_id = %s
-            """, (user.id,))
-
-            order_count = cur.fetchone()[0]
-
+    orders = db.get_user_orders(query.from_user.id, limit=1000)
     await query.edit_message_text(
         "👤 حساب شما\n\n"
-        f"نام: {user.first_name}\n"
-        f"شناسه: {user.id}\n"
-        f"📦 تعداد سفارش‌ها: {order_count}",
+        f"نام: {query.from_user.first_name}\n"
+        f"شناسه: {query.from_user.id}\n"
+        f"📦 تعداد سفارش‌ها: {len(orders)}",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data="back"
-            )]
-        ])
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
+        ]),
     )
 
 
-# =========================================================
-# CALLBACK HANDLER
-# =========================================================
+async def show_support(query):
+    await query.edit_message_text(
+        "📞 پشتیبانی\n\n"
+        "پیام خود را ارسال کنید تا برای مدیریت ارسال شود.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
+        ]),
+    )
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user = query.from_user
-    save_user(user)
-
+    db.save_user(query.from_user)
     data = query.data
 
-    if data == "shop":
-        await query.edit_message_text(
-            "🛒 فروشگاه\n\n"
-            "محصول موردنظر را انتخاب کنید:",
-            reply_markup=shop_menu()
-        )
-
-    elif data.startswith("category:"):
-        category = data.split(":")[1]
-        await show_category(query, category)
-
-    elif data.startswith("product:"):
-        product_id = int(data.split(":")[1])
-        await show_product(query, product_id)
-
-    elif data.startswith("buy:"):
-        product_id = int(data.split(":")[1])
-        await create_order(query, product_id)
-
-    elif data == "orders":
-        await show_orders(query)
-
-    elif data == "account":
-        await show_account(query)
-
-    elif data == "support":
-        await query.edit_message_text(
-            "📞 پشتیبانی\n\n"
-            "برای ارتباط با پشتیبانی پیام خود را ارسال کنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🔙 بازگشت",
-                    callback_data="back"
-                )]
-            ])
-        )
-
-    elif data == "back":
-        await query.edit_message_text(
-            "👋 به فروشگاه ما خوش آمدید.\n\n"
-            "لطفاً یک گزینه را انتخاب کنید:",
-            reply_markup=main_menu()
-        )
-
-    # ---------------- ADMIN ----------------
-
-    elif data == "admin":
-        if not is_admin(user.id):
-            await query.answer(
-                "دسترسی غیرمجاز",
-                show_alert=True
-            )
-            return
-
-        await show_admin_menu(query)
-
-    elif data == "admin_products":
-        if is_admin(user.id):
-            await show_admin_products(query)
-
-    elif data.startswith("admin_price:"):
-        if is_admin(user.id):
-            product_id = int(data.split(":")[1])
-            context.user_data["edit_product_id"] = product_id
-            context.user_data["edit_type"] = "price"
-
+    try:
+        if data == "shop":
             await query.edit_message_text(
-                "💰 قیمت جدید را به تومان ارسال کنید.\n\n"
-                "مثال:\n"
-                "250000"
+                "🛒 فروشگاه\n\nمحصول موردنظر را انتخاب کنید:",
+                reply_markup=shop_menu(),
             )
-            return "WAIT_ADMIN_VALUE"
-
-    elif data.startswith("admin_stock:"):
-        if is_admin(user.id):
-            product_id = int(data.split(":")[1])
-            context.user_data["edit_product_id"] = product_id
-            context.user_data["edit_type"] = "stock"
-
+        elif data.startswith("category:"):
+            await show_category(query, data.split(":", 1)[1])
+        elif data.startswith("product:"):
+            await show_product(query, int(data.split(":", 1)[1]))
+        elif data.startswith("buy:"):
+            await create_order(query, int(data.split(":", 1)[1]))
+        elif data == "orders":
+            await show_orders(query)
+        elif data == "account":
+            await show_account(query)
+        elif data == "support":
+            context.user_data["support_mode"] = True
+            await show_support(query)
+        elif data == "back":
             await query.edit_message_text(
-                "📦 تعداد موجودی جدید را ارسال کنید.\n\n"
-                "مثال:\n"
-                "10"
+                "👋 خوش آمدید.\n\nلطفاً یک گزینه را انتخاب کنید:",
+                reply_markup=main_menu(),
             )
-            return "WAIT_ADMIN_VALUE"
+        elif data == "admin":
+            if is_admin(query.from_user.id):
+                await show_admin_menu(query)
+        elif data == "admin_products":
+            if is_admin(query.from_user.id):
+                await show_admin_products(query)
+        elif data.startswith("admin_price:"):
+            if is_admin(query.from_user.id):
+                context.user_data["edit_product_id"] = int(data.split(":")[1])
+                context.user_data["edit_type"] = "price"
+                await query.edit_message_text("💰 قیمت جدید را به تومان ارسال کنید:")
+                return WAIT_ADMIN_VALUE
+        elif data.startswith("admin_stock:"):
+            if is_admin(query.from_user.id):
+                context.user_data["edit_product_id"] = int(data.split(":")[1])
+                context.user_data["edit_type"] = "stock"
+                await query.edit_message_text("📦 موجودی جدید را ارسال کنید:")
+                return WAIT_ADMIN_VALUE
+        elif data == "admin_add_vpn":
+            if is_admin(query.from_user.id):
+                await query.edit_message_text(
+                    "🔐 کانفیگ VLESS را ارسال کن.\n\n"
+                    "هر پیام فقط یک کانفیگ باشد."
+                )
+                return WAIT_VPN_CONFIG
+        elif data == "admin_orders":
+            if is_admin(query.from_user.id):
+                await show_admin_orders(query)
+        elif data.startswith("admin_order:"):
+            if is_admin(query.from_user.id):
+                await show_admin_order(query, int(data.split(":")[1]))
+        elif data.startswith("approve:"):
+            if is_admin(query.from_user.id):
+                await admin_approve(query, int(data.split(":")[1]))
+        elif data.startswith("reject:"):
+            if is_admin(query.from_user.id):
+                await admin_reject(query, int(data.split(":")[1]))
+        elif data == "admin_inventory":
+            if is_admin(query.from_user.id):
+                await show_inventory(query)
+        elif data == "admin_stats":
+            if is_admin(query.from_user.id):
+                await show_admin_stats(query)
+    except Exception:
+        logger.exception("Callback failed")
+        await query.answer("خطای داخلی رخ داد.", show_alert=True)
 
-    elif data == "admin_orders":
-        if is_admin(user.id):
-            await show_admin_orders(query)
-
-    elif data.startswith("approve:"):
-        if is_admin(user.id):
-            order_id = int(data.split(":")[1])
-            await approve_order(query, order_id)
-
-    elif data.startswith("reject:"):
-        if is_admin(user.id):
-            order_id = int(data.split(":")[1])
-            await reject_order(query, order_id)
-
-    elif data == "admin_stats":
-        if is_admin(user.id):
-            await show_admin_stats(query)
-
-
-# =========================================================
-# ADMIN MENU
-# =========================================================
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    if not is_admin(user.id):
-        await update.message.reply_text(
-            "❌ شما دسترسی مدیریت ندارید."
-        )
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ دسترسی غیرمجاز.")
         return
+    await update.message.reply_text("🔐 پنل مدیریت", reply_markup=admin_keyboard())
 
-    keyboard = [
-        [InlineKeyboardButton(
-            "📦 مدیریت محصولات",
-            callback_data="admin_products"
-        )],
-        [InlineKeyboardButton(
-            "🧾 سفارش‌ها",
-            callback_data="admin_orders"
-        )],
-        [InlineKeyboardButton(
-            "📊 آمار",
-            callback_data="admin_stats"
-        )],
-    ]
 
-    await update.message.reply_text(
-        "🔐 پنل مدیریت\n\n"
-        "یکی از گزینه‌ها را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 مدیریت محصولات", callback_data="admin_products")],
+        [InlineKeyboardButton("🧾 سفارش‌ها", callback_data="admin_orders")],
+        [InlineKeyboardButton("🔐 موجودی VLESS", callback_data="admin_inventory")],
+        [InlineKeyboardButton("📊 آمار", callback_data="admin_stats")],
+    ])
 
 
 async def show_admin_menu(query):
-
-    await query.edit_message_text(
-        "🔐 پنل مدیریت",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "📦 مدیریت محصولات",
-                callback_data="admin_products"
-            )],
-            [InlineKeyboardButton(
-                "🧾 سفارش‌ها",
-                callback_data="admin_orders"
-            )],
-            [InlineKeyboardButton(
-                "📊 آمار",
-                callback_data="admin_stats"
-            )]
-        ])
-    )
+    await query.edit_message_text("🔐 پنل مدیریت", reply_markup=admin_keyboard())
 
 
 async def show_admin_products(query):
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, category, name, duration, price, stock
-                FROM products
-                ORDER BY category, duration
-            """)
-
-            products = cur.fetchall()
-
+    products = db.get_products()
     keyboard = []
-
-    for product_id, category, name, duration, price, stock in products:
-
-        category_name = (
-            "📱 تلگرام"
-            if category == "telegram"
-            else "🌐 VPN"
-        )
-
+    for pid, category, name, duration, price, stock, active in products:
+        cat = "📱" if category == "telegram" else "🌐"
         keyboard.append([
             InlineKeyboardButton(
-                f"{category_name} {duration} ماهه",
-                callback_data=f"admin_price:{product_id}"
+                f"{cat} {duration} ماهه | {format_price(price)}",
+                callback_data=f"admin_price:{pid}",
             )
         ])
+        if category != "vpn":
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"📦 موجودی: {stock}",
+                    callback_data=f"admin_stock:{pid}",
+                )
+            ])
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"💰 {format_price(price)} | 📦 {stock}",
-                callback_data=f"admin_stock:{product_id}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 پنل مدیریت",
-            callback_data="admin"
-        )
-    ])
-
+    keyboard.append([InlineKeyboardButton("➕ افزودن VLESS", callback_data="admin_add_vpn")])
+    keyboard.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")])
     await query.edit_message_text(
-        "📦 مدیریت محصولات\n\n"
-        "برای تغییر قیمت روی ردیف محصول و برای تغییر موجودی روی ردیف قیمت/موجودی بزن:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "📦 مدیریت محصولات:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# =========================================================
-# ADMIN VALUE HANDLER
-# =========================================================
+async def show_admin_orders(query):
+    orders = db.get_admin_orders()
+    if not orders:
+        await query.edit_message_text(
+            "🧾 هنوز سفارشی ثبت نشده.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")]
+            ]),
+        )
+        return
 
-async def admin_value_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    keyboard = []
+    for oid, user_id, name, duration, price, status, created_at in orders:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status_name(status)} #{oid} | {format_price(price)}",
+                callback_data=f"admin_order:{oid}",
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")])
+    await query.edit_message_text(
+        "🧾 سفارش‌های اخیر:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-    user = update.effective_user
 
-    if not is_admin(user.id):
+async def show_admin_order(query, order_id):
+    order = db.get_order(order_id)
+    if not order:
+        await query.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+
+    oid, user_id, product_id, category, name, duration, price, status, created = order
+    text = (
+        f"🧾 سفارش #{oid}\n\n"
+        f"👤 کاربر: {user_id}\n"
+        f"📦 {name}\n"
+        f"📅 {duration} ماه\n"
+        f"💰 {format_price(price)}\n"
+        f"📌 وضعیت: {status_name(status)}"
+    )
+
+    keyboard = []
+    if status == "pending_payment":
+        keyboard.append([
+            InlineKeyboardButton("✅ تأیید پرداخت/تحویل", callback_data=f"approve:{oid}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"reject:{oid}"),
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 سفارش‌ها", callback_data="admin_orders")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_approve(query, order_id):
+    delivery, result = db.approve_order(order_id)
+    if result != "OK":
+        messages = {
+            "NOT_FOUND": "سفارش پیدا نشد.",
+            "NOT_PENDING": "این سفارش قبلاً پردازش شده.",
+            "OUT_OF_STOCK": "کانفیگ VLESS موجود نیست.",
+        }
+        await query.answer(messages.get(result, "تأیید انجام نشد."), show_alert=True)
+        return
+
+    order = db.get_order(order_id)
+    if order:
+        user_id = order[1]
+        if delivery:
+            try:
+                await context_bot_send(query, user_id, f"✅ پرداخت/سفارش #{order_id} تأیید شد.\n\n🔐 کانفیگ VLESS:\n\n{delivery}")
+            except Exception:
+                logger.exception("Delivery message failed")
+
+    await query.answer("سفارش تأیید و در صورت وجود، کانفیگ تحویل شد.", show_alert=True)
+    await show_admin_order(query, order_id)
+
+
+async def context_bot_send(query, user_id, text):
+    await query.get_bot().send_message(chat_id=user_id, text=text)
+
+
+async def admin_reject(query, order_id):
+    result = db.reject_order(order_id)
+    if not result:
+        await query.answer("این سفارش قابل رد نیست.", show_alert=True)
+        return
+
+    _, user_id = result
+    try:
+        await query.get_bot().send_message(
+            chat_id=user_id,
+            text=f"❌ سفارش #{order_id} رد شد.",
+        )
+    except Exception:
+        logger.exception("Reject notification failed")
+
+    await query.answer("سفارش رد شد.", show_alert=True)
+    await show_admin_order(query, order_id)
+
+
+async def show_inventory(query):
+    inventory = db.get_vpn_inventory()
+    if not inventory:
+        text = "🔐 هیچ کانفیگی ثبت نشده است."
+    else:
+        lines = ["🔐 موجودی VLESS:\n"]
+        for cid, name, duration, status, created in inventory:
+            lines.append(f"#{cid} | {duration} ماه | {status}")
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ افزودن VLESS", callback_data="admin_add_vpn")],
+            [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")],
+        ]),
+    )
+
+
+async def admin_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     text = update.message.text.strip()
-
     if not text.isdigit():
-        await update.message.reply_text(
-            "❌ فقط عدد وارد کن."
-        )
-        return "WAIT_ADMIN_VALUE"
-
-    value = int(text)
+        await update.message.reply_text("❌ فقط عدد وارد کن.")
+        return WAIT_ADMIN_VALUE
 
     product_id = context.user_data.get("edit_product_id")
     edit_type = context.user_data.get("edit_type")
-
     if not product_id:
         return ConversationHandler.END
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            if edit_type == "price":
-                cur.execute("""
-                    UPDATE products
-                    SET price = %s
-                    WHERE id = %s
-                """, (value, product_id))
-
-                message = (
-                    f"✅ قیمت با موفقیت تغییر کرد.\n"
-                    f"قیمت جدید: {format_price(value)}"
-                )
-
-            else:
-                cur.execute("""
-                    UPDATE products
-                    SET stock = %s
-                    WHERE id = %s
-                """, (value, product_id))
-
-                message = (
-                    f"✅ موجودی با موفقیت تغییر کرد.\n"
-                    f"موجودی جدید: {value}"
-                )
-
-        conn.commit()
+    value = int(text)
+    if edit_type == "price":
+        db.update_product_value(product_id, "price", value)
+        message = f"✅ قیمت جدید: {format_price(value)}"
+    else:
+        db.update_product_value(product_id, "stock", value)
+        message = f"✅ موجودی جدید: {value}"
 
     context.user_data.clear()
-
     await update.message.reply_text(
         message,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "📦 مدیریت محصولات",
-                callback_data="admin_products"
-            )]
-        ])
+            [InlineKeyboardButton("📦 مدیریت محصولات", callback_data="admin_products")]
+        ]),
     )
-
     return ConversationHandler.END
 
 
-# =========================================================
-# ADMIN ORDERS
-# =========================================================
+async def vpn_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
 
-async def show_admin_orders(query):
+    config = update.message.text.strip()
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    orders.id,
-                    orders.user_id,
-                    products.name,
-                    products.duration,
-                    orders.price,
-                    orders.status
-                FROM orders
-                JOIN products
-                ON products.id = orders.product_id
-                ORDER BY orders.id DESC
-                LIMIT 20
-            """)
+    # Add to the first active VPN product. Duration-specific inventory
+    # can be extended later without changing the delivery architecture.
+    products = db.get_products("vpn")
+    target = next((p for p in products if p[6]), None)
+    if not target:
+        await update.message.reply_text("❌ محصول VPN فعال پیدا نشد.")
+        return ConversationHandler.END
 
-            orders = cur.fetchall()
+    try:
+        cid = db.add_vpn_config(target[0], config)
+    except Exception:
+        logger.exception("Could not add VLESS config")
+        await update.message.reply_text("❌ ثبت کانفیگ انجام نشد؛ ممکن است تکراری باشد.")
+        return WAIT_VPN_CONFIG
 
-    if not orders:
-        await query.edit_message_text(
-            "🧾 هنوز سفارشی ثبت نشده است.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )]
-            ])
-        )
+    context.user_data.clear()
+    await update.message.reply_text(
+        f"✅ کانفیگ VLESS با شناسه #{cid} ثبت شد.",
+        reply_markup=admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.user_data.get("support_mode"):
         return
 
-    keyboard = []
+    message = update.message.text.strip()
+    if not message:
+        return
 
-    for order_id, user_id, name, duration, price, status in orders:
+    with db.get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO support_messages (user_id, message)
+                VALUES (%s, %s)
+            """, (user.id, message))
+        conn.commit()
 
-        status_icon = {
-            "pending": "⏳",
-            "approved": "✅",
-            "rejected": "❌"
-        }.get(status, "❓")
+    context.user_data.clear()
+    await update.message.reply_text(
+        "✅ پیام شما برای پشتیبانی ارسال شد.",
+        reply_markup=main_menu(),
+    )
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{status_icon} سفارش #{order_id}",
-                callback_data=f"admin_order:{order_id}"
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=int(ADMIN_ID),
+                text=f"📞 پیام پشتیبانی جدید\n\n👤 {user.id}\n\n{message}",
             )
-        ])
+        except Exception:
+            logger.exception("Support notification failed")
 
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 پنل مدیریت",
-            callback_data="admin"
-        )
-    ])
-
-    await query.edit_message_text(
-        "🧾 سفارش‌های اخیر:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def approve_order(query, order_id):
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                UPDATE orders
-                SET status = 'approved'
-                WHERE id = %s
-                AND status = 'pending'
-                RETURNING user_id
-            """, (order_id,))
-
-            result = cur.fetchone()
-
-        conn.commit()
-
-    if not result:
-        await query.answer(
-            "این سفارش قابل تأیید نیست.",
-            show_alert=True
-        )
-        return
-
-    await query.answer(
-        "سفارش تأیید شد.",
-        show_alert=True
-    )
-
-
-async def reject_order(query, order_id):
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT product_id, user_id
-                FROM orders
-                WHERE id = %s
-                AND status = 'pending'
-            """, (order_id,))
-
-            order = cur.fetchone()
-
-            if not order:
-                await query.answer(
-                    "این سفارش قابل رد کردن نیست.",
-                    show_alert=True
-                )
-                return
-
-            product_id, user_id = order
-
-            cur.execute("""
-                UPDATE orders
-                SET status = 'rejected'
-                WHERE id = %s
-            """, (order_id,))
-
-            # آزاد کردن موجودی رزرو شده
-            cur.execute("""
-                UPDATE products
-                SET stock = stock + 1
-                WHERE id = %s
-            """, (product_id,))
-
-        conn.commit()
-
-    await query.answer(
-        "سفارش رد شد و موجودی آزاد شد.",
-        show_alert=True
-    )
-
-
-# =========================================================
-# ADMIN STATS
-# =========================================================
 
 async def show_admin_stats(query):
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-
-            cur.execute("SELECT COUNT(*) FROM users")
-            users = cur.fetchone()[0]
-
-            cur.execute("SELECT COUNT(*) FROM orders")
-            orders = cur.fetchone()[0]
-
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM orders
-                WHERE status = 'approved'
-            """)
-            approved = cur.fetchone()[0]
-
-            cur.execute("""
-                SELECT COALESCE(SUM(price), 0)
-                FROM orders
-                WHERE status = 'approved'
-            """)
-            revenue = cur.fetchone()[0]
-
+    users, orders, approved, revenue, vpn_available = db.stats()
     await query.edit_message_text(
         "📊 آمار فروشگاه\n\n"
         f"👥 کاربران: {users}\n"
-        f"🧾 کل سفارش‌ها: {orders}\n"
-        f"✅ سفارش‌های تأییدشده: {approved}\n"
-        f"💰 فروش تأییدشده: {format_price(revenue)}",
+        f"🧾 سفارش‌ها: {orders}\n"
+        f"✅ تأییدشده: {approved}\n"
+        f"💰 فروش تأییدشده: {format_price(revenue)}\n"
+        f"🔐 VLESS آزاد: {vpn_available}",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "🔙 پنل مدیریت",
-                callback_data="admin"
-            )]
-        ])
+            [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")]
+        ]),
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
+async def error_handler(update, context):
+    logger.exception("Unhandled error", exc_info=context.error)
+
 
 def main():
-
     if not TOKEN:
         raise ValueError("BOT_TOKEN is not set")
-
     if not RENDER_URL:
         raise ValueError("RENDER_EXTERNAL_URL is not set")
-
     if not ADMIN_ID:
         raise ValueError("ADMIN_ID is not set")
 
-    init_db()
+    db.init_db()
 
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
 
-    conversation_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                button_handler,
-                pattern=r"^admin_(price|stock):"
-            )
-        ],
+    # Support mode: only active after the user presses Support.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        support_handler,
+    ))
+
+    admin_value_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(
+            button_handler, pattern=r"^admin_(price|stock):"
+        )],
         states={
-            "WAIT_ADMIN_VALUE": [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    admin_value_handler
-                )
+            WAIT_ADMIN_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_value_handler)
             ]
         },
-        fallbacks=[]
+        fallbacks=[],
     )
+    app.add_handler(admin_value_conversation)
 
-    app.add_handler(conversation_handler)
-
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
+    vpn_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(
+            button_handler, pattern=r"^admin_add_vpn$"
+        )],
+        states={
+            WAIT_VPN_CONFIG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vpn_config_handler)
+            ]
+        },
+        fallbacks=[],
     )
+    app.add_handler(vpn_conversation)
+
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    app.add_error_handler(error_handler)
 
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path="telegram",
         webhook_url=f"{RENDER_URL}/telegram",
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
 
 
 if __name__ == "__main__":
-     main()
+    main()
