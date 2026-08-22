@@ -38,7 +38,7 @@ async def start(update: Update, context):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-        async def button_handler(update: Update, context):
+    async def button_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
 
