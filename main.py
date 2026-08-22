@@ -1,12 +1,16 @@
 import os
 import psycopg
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+
 def init_db():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set")
@@ -22,51 +26,39 @@ def init_db():
                 )
             """)
         conn.commit()
-async def start(update: Update, context):
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🛒 فروشگاه", callback_data="shop")],
         [InlineKeyboardButton("📦 محصولات", callback_data="products")],
         [InlineKeyboardButton("👤 حساب من", callback_data="account")],
-        [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")],
+        [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")]
     ]
 
     await update.message.reply_text(
         "سلام 👋\n"
         "به فروشگاه ما خوش آمدید.\n\n"
         "لطفاً یک گزینه را انتخاب کنید:",
-     
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-    async def button_handler(update: Update, context):
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "shop":
+    if query.data == "shop" or query.data == "products":
         keyboard = [
             [InlineKeyboardButton("📱 تلگرام پریمیوم", callback_data="telegram")],
             [InlineKeyboardButton("🔐 اکانت‌ها", callback_data="accounts")],
             [InlineKeyboardButton("🌐 کانفیگ VPN", callback_data="vpn")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
         ]
 
         await query.edit_message_text(
             "🛒 فروشگاه\n\n"
             "لطفاً دسته‌بندی موردنظر را انتخاب کنید:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif query.data == "products":
-        keyboard = [
-            [InlineKeyboardButton("📱 تلگرام پریمیوم", callback_data="telegram")],
-            [InlineKeyboardButton("🔐 اکانت‌ها", callback_data="accounts")],
-            [InlineKeyboardButton("🌐 کانفیگ VPN", callback_data="vpn")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
-        ]
-
-        await query.edit_message_text(
-            "📦 محصولات\n\n"
-            "دسته‌بندی محصولات را انتخاب کنید:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -91,13 +83,11 @@ async def start(update: Update, context):
     elif query.data == "account":
         user = query.from_user
 
-        text = (
+        await query.edit_message_text(
             "👤 حساب شما\n\n"
             f"نام: {user.first_name}\n"
             f"شناسه: {user.id}"
         )
-
-        await query.edit_message_text(text)
 
     elif query.data == "support":
         await query.edit_message_text(
@@ -110,7 +100,7 @@ async def start(update: Update, context):
             [InlineKeyboardButton("🛒 فروشگاه", callback_data="shop")],
             [InlineKeyboardButton("📦 محصولات", callback_data="products")],
             [InlineKeyboardButton("👤 حساب من", callback_data="account")],
-            [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")],
+            [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")]
         ]
 
         await query.edit_message_text(
@@ -120,13 +110,15 @@ async def start(update: Update, context):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    else:
-        await query.edit_message_text("❌ گزینه نامعتبر است.")
+
+def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN is not set")
 
     if not RENDER_URL:
         raise ValueError("RENDER_EXTERNAL_URL is not set")
+
+    init_db()
 
     app = Application.builder().token(TOKEN).build()
 
@@ -138,7 +130,7 @@ async def start(update: Update, context):
         port=PORT,
         url_path="telegram",
         webhook_url=f"{RENDER_URL}/telegram",
-        drop_pending_updates=True,
+        drop_pending_updates=True
     )
 
 
