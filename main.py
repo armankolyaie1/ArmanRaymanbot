@@ -35,7 +35,7 @@ async def start(update: Update, context):
         "به فروشگاه ما خوش آمدید.\n\n"
         "لطفاً یک گزینه را انتخاب کنید:",
      
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(keyboard)
 
         async def button_handler(update: Update, context):
     query = update.callback_query
