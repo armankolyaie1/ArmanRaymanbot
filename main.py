@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,7 +22,6 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 
 WAIT_ADMIN_VALUE = 1
 WAIT_VPN_CONFIG = 2
-WAIT_SUPPORT = 3
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_admin(user_id):
-    return ADMIN_ID and str(user_id) == str(ADMIN_ID)
+    return bool(ADMIN_ID and str(user_id) == str(ADMIN_ID))
 
 
 def format_price(price):
@@ -69,9 +69,14 @@ def shop_menu():
     ])
 
 
+async def db_call(func, *args, **kwargs):
+    """Run blocking psycopg work outside Telegram's event loop."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db.save_user(user)
+    await db_call(db.save_user, user)
     await update.message.reply_text(
         "سلام 👋\n\nبه فروشگاه ما خوش آمدید.\n\nمحصول موردنظر را انتخاب کنید:",
         reply_markup=main_menu(),
@@ -80,26 +85,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_category(query, category):
     title = "📱 تلگرام پریمیوم" if category == "telegram" else "🌐 VPN / VLESS"
-    products = db.get_products(category)
+    products = await db_call(db.get_products, category)
 
     keyboard = []
     for product_id, _, _, duration, price, stock, active in products:
         if not active:
             continue
-
         if price <= 0:
             label = f"{duration} ماهه | قیمت تعیین نشده"
         elif stock <= 0:
             label = f"{duration} ماهه | ناموجود"
         else:
             label = f"{duration} ماهه | {format_price(price)}"
-
         keyboard.append([
             InlineKeyboardButton(label, callback_data=f"product:{product_id}")
         ])
 
     keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="shop")])
-
     await query.edit_message_text(
         f"{title}\n\nپلن موردنظر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -107,29 +109,22 @@ async def show_category(query, category):
 
 
 async def show_product(query, product_id):
-    product = db.get_product(product_id)
+    product = await db_call(db.get_product, product_id)
     if not product:
         await query.answer("محصول پیدا نشد.", show_alert=True)
         return
 
     pid, category, name, duration, price, stock, active = product
-
     if not active:
         text = f"{name}\n\n❌ این محصول غیرفعال است."
         keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
     elif price <= 0:
-        text = (
-            f"{name}\n"
-            f"پلن: {duration} ماهه\n\n"
-            "❌ قیمت این پلن هنوز تعیین نشده است."
-        )
+        text = f"{name}\nپلن: {duration} ماهه\n\n❌ قیمت این پلن هنوز تعیین نشده است."
         keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
     elif stock <= 0:
         text = (
-            f"{name}\n"
-            f"پلن: {duration} ماهه\n\n"
-            f"💰 قیمت: {format_price(price)}\n"
-            "❌ این پلن فعلاً ناموجود است."
+            f"{name}\nپلن: {duration} ماهه\n\n"
+            f"💰 قیمت: {format_price(price)}\n❌ این پلن فعلاً ناموجود است."
         )
         keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")]]
     else:
@@ -144,14 +139,14 @@ async def show_product(query, product_id):
             [InlineKeyboardButton("🛒 ثبت سفارش", callback_data=f"buy:{pid}")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data=f"category:{category}")],
         ]
-
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def create_order(query, product_id):
-    user = query.from_user
     try:
-        order_id, name, duration, price = db.create_order(user.id, product_id)
+        order_id, name, duration, price = await db_call(
+            db.create_order, query.from_user.id, product_id
+        )
     except ValueError as exc:
         messages = {
             "PRODUCT_NOT_FOUND": "محصول پیدا نشد.",
@@ -162,8 +157,6 @@ async def create_order(query, product_id):
         await query.answer(messages.get(str(exc), "ثبت سفارش انجام نشد."), show_alert=True)
         return
 
-    # Payment gateway is intentionally isolated here.
-    # The order is NOT marked paid until gateway verification succeeds.
     await query.edit_message_text(
         f"✅ سفارش #{order_id} ایجاد شد.\n\n"
         f"📦 محصول: {name}\n"
@@ -179,20 +172,17 @@ async def create_order(query, product_id):
 
 
 async def show_orders(query):
-    orders = db.get_user_orders(query.from_user.id)
+    orders = await db_call(db.get_user_orders, query.from_user.id)
     if not orders:
         text = "📦 شما هنوز سفارشی ثبت نکرده‌اید."
     else:
         lines = ["📦 سفارش‌های شما:\n"]
         for oid, name, duration, price, status, created_at in orders:
             lines.append(
-                f"🧾 #{oid}\n"
-                f"{name} - {duration} ماه\n"
-                f"💰 {format_price(price)}\n"
-                f"وضعیت: {status_name(status)}\n"
+                f"🧾 #{oid}\n{name} - {duration} ماه\n"
+                f"💰 {format_price(price)}\nوضعیت: {status_name(status)}\n"
             )
         text = "\n".join(lines)
-
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup([
@@ -202,12 +192,12 @@ async def show_orders(query):
 
 
 async def show_account(query):
-    orders = db.get_user_orders(query.from_user.id, limit=1000)
+    count = await db_call(db.get_user_order_count, query.from_user.id)
     await query.edit_message_text(
         "👤 حساب شما\n\n"
         f"نام: {query.from_user.first_name}\n"
         f"شناسه: {query.from_user.id}\n"
-        f"📦 تعداد سفارش‌ها: {len(orders)}",
+        f"📦 تعداد سفارش‌ها: {count}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
         ]),
@@ -216,8 +206,7 @@ async def show_account(query):
 
 async def show_support(query):
     await query.edit_message_text(
-        "📞 پشتیبانی\n\n"
-        "پیام خود را ارسال کنید تا برای مدیریت ارسال شود.",
+        "📞 پشتیبانی\n\nپیام خود را ارسال کنید تا برای مدیریت ارسال شود.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
         ]),
@@ -227,7 +216,6 @@ async def show_support(query):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    db.save_user(query.from_user)
     data = query.data
 
     try:
@@ -250,56 +238,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["support_mode"] = True
             await show_support(query)
         elif data == "back":
+            context.user_data.pop("support_mode", None)
             await query.edit_message_text(
                 "👋 خوش آمدید.\n\nلطفاً یک گزینه را انتخاب کنید:",
                 reply_markup=main_menu(),
             )
-        elif data == "admin":
-            if is_admin(query.from_user.id):
-                await show_admin_menu(query)
-        elif data == "admin_products":
-            if is_admin(query.from_user.id):
-                await show_admin_products(query)
-        elif data.startswith("admin_price:"):
-            if is_admin(query.from_user.id):
-                context.user_data["edit_product_id"] = int(data.split(":")[1])
-                context.user_data["edit_type"] = "price"
-                await query.edit_message_text("💰 قیمت جدید را به تومان ارسال کنید:")
-                return WAIT_ADMIN_VALUE
-        elif data.startswith("admin_stock:"):
-            if is_admin(query.from_user.id):
-                context.user_data["edit_product_id"] = int(data.split(":")[1])
-                context.user_data["edit_type"] = "stock"
-                await query.edit_message_text("📦 موجودی جدید را ارسال کنید:")
-                return WAIT_ADMIN_VALUE
-        elif data == "admin_add_vpn":
-            if is_admin(query.from_user.id):
-                await query.edit_message_text(
-                    "🔐 کانفیگ VLESS را ارسال کن.\n\n"
-                    "هر پیام فقط یک کانفیگ باشد."
-                )
-                return WAIT_VPN_CONFIG
-        elif data == "admin_orders":
-            if is_admin(query.from_user.id):
-                await show_admin_orders(query)
-        elif data.startswith("admin_order:"):
-            if is_admin(query.from_user.id):
-                await show_admin_order(query, int(data.split(":")[1]))
-        elif data.startswith("approve:"):
-            if is_admin(query.from_user.id):
-                await admin_approve(query, int(data.split(":")[1]))
-        elif data.startswith("reject:"):
-            if is_admin(query.from_user.id):
-                await admin_reject(query, int(data.split(":")[1]))
-        elif data == "admin_inventory":
-            if is_admin(query.from_user.id):
-                await show_inventory(query)
-        elif data == "admin_stats":
-            if is_admin(query.from_user.id):
-                await show_admin_stats(query)
+        elif data == "admin" and is_admin(query.from_user.id):
+            await show_admin_menu(query)
+        elif data == "admin_products" and is_admin(query.from_user.id):
+            await show_admin_products(query)
+        elif data.startswith("admin_price:") and is_admin(query.from_user.id):
+            context.user_data["edit_product_id"] = int(data.split(":")[1])
+            context.user_data["edit_type"] = "price"
+            await query.edit_message_text("💰 قیمت جدید را به تومان ارسال کنید:")
+            return WAIT_ADMIN_VALUE
+        elif data.startswith("admin_stock:") and is_admin(query.from_user.id):
+            context.user_data["edit_product_id"] = int(data.split(":")[1])
+            context.user_data["edit_type"] = "stock"
+            await query.edit_message_text("📦 موجودی جدید را ارسال کنید:")
+            return WAIT_ADMIN_VALUE
+        elif data == "admin_add_vpn" and is_admin(query.from_user.id):
+            await query.edit_message_text(
+                "🔐 کانفیگ VLESS را ارسال کن.\n\nهر پیام فقط یک کانفیگ باشد."
+            )
+            return WAIT_VPN_CONFIG
+        elif data == "admin_orders" and is_admin(query.from_user.id):
+            await show_admin_orders(query)
+        elif data.startswith("admin_order:") and is_admin(query.from_user.id):
+            await show_admin_order(query, int(data.split(":")[1]))
+        elif data.startswith("approve:") and is_admin(query.from_user.id):
+            await admin_approve(query, int(data.split(":")[1]))
+        elif data.startswith("reject:") and is_admin(query.from_user.id):
+            await admin_reject(query, int(data.split(":")[1]))
+        elif data == "admin_inventory" and is_admin(query.from_user.id):
+            await show_inventory(query)
+        elif data == "admin_stats" and is_admin(query.from_user.id):
+            await show_admin_stats(query)
     except Exception:
         logger.exception("Callback failed")
-        await query.answer("خطای داخلی رخ داد.", show_alert=True)
+        try:
+            await query.answer("خطای داخلی رخ داد.", show_alert=True)
+        except Exception:
+            pass
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,7 +303,7 @@ async def show_admin_menu(query):
 
 
 async def show_admin_products(query):
-    products = db.get_products()
+    products = await db_call(db.get_products)
     keyboard = []
     for pid, category, name, duration, price, stock, active in products:
         cat = "📱" if category == "telegram" else "🌐"
@@ -340,7 +320,6 @@ async def show_admin_products(query):
                     callback_data=f"admin_stock:{pid}",
                 )
             ])
-
     keyboard.append([InlineKeyboardButton("➕ افزودن VLESS", callback_data="admin_add_vpn")])
     keyboard.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")])
     await query.edit_message_text(
@@ -350,7 +329,7 @@ async def show_admin_products(query):
 
 
 async def show_admin_orders(query):
-    orders = db.get_admin_orders()
+    orders = await db_call(db.get_admin_orders)
     if not orders:
         await query.edit_message_text(
             "🧾 هنوز سفارشی ثبت نشده.",
@@ -359,7 +338,6 @@ async def show_admin_orders(query):
             ]),
         )
         return
-
     keyboard = []
     for oid, user_id, name, duration, price, status, created_at in orders:
         keyboard.append([
@@ -376,21 +354,16 @@ async def show_admin_orders(query):
 
 
 async def show_admin_order(query, order_id):
-    order = db.get_order(order_id)
+    order = await db_call(db.get_order, order_id)
     if not order:
         await query.answer("سفارش پیدا نشد.", show_alert=True)
         return
-
     oid, user_id, product_id, category, name, duration, price, status, created = order
     text = (
-        f"🧾 سفارش #{oid}\n\n"
-        f"👤 کاربر: {user_id}\n"
-        f"📦 {name}\n"
-        f"📅 {duration} ماه\n"
-        f"💰 {format_price(price)}\n"
+        f"🧾 سفارش #{oid}\n\n👤 کاربر: {user_id}\n📦 {name}\n"
+        f"📅 {duration} ماه\n💰 {format_price(price)}\n"
         f"📌 وضعیت: {status_name(status)}"
     )
-
     keyboard = []
     if status == "pending_payment":
         keyboard.append([
@@ -402,7 +375,7 @@ async def show_admin_order(query, order_id):
 
 
 async def admin_approve(query, order_id):
-    delivery, result = db.approve_order(order_id)
+    delivery, result = await db_call(db.approve_order, order_id)
     if result != "OK":
         messages = {
             "NOT_FOUND": "سفارش پیدا نشد.",
@@ -411,45 +384,37 @@ async def admin_approve(query, order_id):
         }
         await query.answer(messages.get(result, "تأیید انجام نشد."), show_alert=True)
         return
-
-    order = db.get_order(order_id)
-    if order:
-        user_id = order[1]
-        if delivery:
-            try:
-                await context_bot_send(query, user_id, f"✅ پرداخت/سفارش #{order_id} تأیید شد.\n\n🔐 کانفیگ VLESS:\n\n{delivery}")
-            except Exception:
-                logger.exception("Delivery message failed")
-
+    order = await db_call(db.get_order, order_id)
+    if order and delivery:
+        try:
+            await query.get_bot().send_message(
+                chat_id=order[1],
+                text=f"✅ پرداخت/سفارش #{order_id} تأیید شد.\n\n🔐 کانفیگ VLESS:\n\n{delivery}",
+            )
+        except Exception:
+            logger.exception("Delivery message failed")
     await query.answer("سفارش تأیید و در صورت وجود، کانفیگ تحویل شد.", show_alert=True)
     await show_admin_order(query, order_id)
 
 
-async def context_bot_send(query, user_id, text):
-    await query.get_bot().send_message(chat_id=user_id, text=text)
-
-
 async def admin_reject(query, order_id):
-    result = db.reject_order(order_id)
+    result = await db_call(db.reject_order, order_id)
     if not result:
         await query.answer("این سفارش قابل رد نیست.", show_alert=True)
         return
-
     _, user_id = result
     try:
         await query.get_bot().send_message(
-            chat_id=user_id,
-            text=f"❌ سفارش #{order_id} رد شد.",
+            chat_id=user_id, text=f"❌ سفارش #{order_id} رد شد."
         )
     except Exception:
         logger.exception("Reject notification failed")
-
     await query.answer("سفارش رد شد.", show_alert=True)
     await show_admin_order(query, order_id)
 
 
 async def show_inventory(query):
-    inventory = db.get_vpn_inventory()
+    inventory = await db_call(db.get_vpn_inventory)
     if not inventory:
         text = "🔐 هیچ کانفیگی ثبت نشده است."
     else:
@@ -457,7 +422,6 @@ async def show_inventory(query):
         for cid, name, duration, status, created in inventory:
             lines.append(f"#{cid} | {duration} ماه | {status}")
         text = "\n".join(lines)
-
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup([
@@ -470,25 +434,17 @@ async def show_inventory(query):
 async def admin_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     text = update.message.text.strip()
     if not text.isdigit():
         await update.message.reply_text("❌ فقط عدد وارد کن.")
         return WAIT_ADMIN_VALUE
-
     product_id = context.user_data.get("edit_product_id")
     edit_type = context.user_data.get("edit_type")
     if not product_id:
         return ConversationHandler.END
-
     value = int(text)
-    if edit_type == "price":
-        db.update_product_value(product_id, "price", value)
-        message = f"✅ قیمت جدید: {format_price(value)}"
-    else:
-        db.update_product_value(product_id, "stock", value)
-        message = f"✅ موجودی جدید: {value}"
-
+    await db_call(db.update_product_value, product_id, edit_type, value)
+    message = f"✅ قیمت جدید: {format_price(value)}" if edit_type == "price" else f"✅ موجودی جدید: {value}"
     context.user_data.clear()
     await update.message.reply_text(
         message,
@@ -502,24 +458,18 @@ async def admin_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def vpn_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     config = update.message.text.strip()
-
-    # Add to the first active VPN product. Duration-specific inventory
-    # can be extended later without changing the delivery architecture.
-    products = db.get_products("vpn")
+    products = await db_call(db.get_products, "vpn")
     target = next((p for p in products if p[6]), None)
     if not target:
         await update.message.reply_text("❌ محصول VPN فعال پیدا نشد.")
         return ConversationHandler.END
-
     try:
-        cid = db.add_vpn_config(target[0], config)
+        cid = await db_call(db.add_vpn_config, target[0], config)
     except Exception:
         logger.exception("Could not add VLESS config")
         await update.message.reply_text("❌ ثبت کانفیگ انجام نشد؛ ممکن است تکراری باشد.")
         return WAIT_VPN_CONFIG
-
     context.user_data.clear()
     await update.message.reply_text(
         f"✅ کانفیگ VLESS با شناسه #{cid} ثبت شد.",
@@ -532,25 +482,15 @@ async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not context.user_data.get("support_mode"):
         return
-
     message = update.message.text.strip()
     if not message:
         return
-
-    with db.get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO support_messages (user_id, message)
-                VALUES (%s, %s)
-            """, (user.id, message))
-        conn.commit()
-
+    await db_call(db.add_support_message, user.id, message)
     context.user_data.clear()
     await update.message.reply_text(
         "✅ پیام شما برای پشتیبانی ارسال شد.",
         reply_markup=main_menu(),
     )
-
     if ADMIN_ID:
         try:
             await context.bot.send_message(
@@ -562,13 +502,11 @@ async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_admin_stats(query):
-    users, orders, approved, revenue, vpn_available = db.stats()
+    users, orders, approved, revenue, vpn_available = await db_call(db.stats)
     await query.edit_message_text(
         "📊 آمار فروشگاه\n\n"
-        f"👥 کاربران: {users}\n"
-        f"🧾 سفارش‌ها: {orders}\n"
-        f"✅ تأییدشده: {approved}\n"
-        f"💰 فروش تأییدشده: {format_price(revenue)}\n"
+        f"👥 کاربران: {users}\n🧾 سفارش‌ها: {orders}\n"
+        f"✅ تأییدشده: {approved}\n💰 فروش تأییدشده: {format_price(revenue)}\n"
         f"🔐 VLESS آزاد: {vpn_available}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")]
@@ -580,6 +518,14 @@ async def error_handler(update, context):
     logger.exception("Unhandled error", exc_info=context.error)
 
 
+async def post_init(application):
+    await asyncio.to_thread(db.init_db)
+
+
+async def post_shutdown(application):
+    await asyncio.to_thread(db.close_pool)
+
+
 def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN is not set")
@@ -588,48 +534,37 @@ def main():
     if not ADMIN_ID:
         raise ValueError("ADMIN_ID is not set")
 
-    db.init_db()
-
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
 
     admin_value_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(
-            button_handler, pattern=r"^admin_(price|stock):"
-        )],
-        states={
-            WAIT_ADMIN_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_value_handler)
-            ]
-        },
+        entry_points=[CallbackQueryHandler(button_handler, pattern=r"^admin_(price|stock):")],
+        states={WAIT_ADMIN_VALUE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_value_handler)
+        ]},
         fallbacks=[],
     )
     app.add_handler(admin_value_conversation)
 
     vpn_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(
-            button_handler, pattern=r"^admin_add_vpn$"
-        )],
-        states={
-            WAIT_VPN_CONFIG: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, vpn_config_handler)
-            ]
-        },
+        entry_points=[CallbackQueryHandler(button_handler, pattern=r"^admin_add_vpn$")],
+        states={WAIT_VPN_CONFIG: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, vpn_config_handler)
+        ]},
         fallbacks=[],
     )
     app.add_handler(vpn_conversation)
 
-    # Support handler must come after admin conversations so admin text
-    # is consumed by the active ConversationHandler state.
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        support_handler,
-    ))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, support_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
-
     app.add_error_handler(error_handler)
 
     app.run_webhook(
